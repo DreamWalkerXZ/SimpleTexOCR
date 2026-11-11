@@ -1,38 +1,58 @@
 import { environment, closeMainWindow, getPreferenceValues, Clipboard, showHUD, LocalStorage } from "@raycast/api";
 import { join } from "path";
-import { execSync } from "child_process";
-import axios from "axios";
-import FormData from "form-data";
+import { execFileSync, execSync } from "child_process";
 import fs from "fs";
 
 export default async () => {
-  console.log(await LocalStorage.getItem<string>("format"));
   await closeMainWindow();
   const savePath = join(environment.supportPath, "capture.png");
 
   execSync(`/usr/sbin/screencapture -i '${savePath}'`);
-  // 检查文件是否存在
   if (!fs.existsSync(savePath)) {
     await showHUD("❌ Screenshot failed");
     return;
   }
-  const token = getPreferenceValues().token;
-  const file = fs.readFileSync(savePath);
-  const formData = new FormData();
-  formData.append("file", file, "capture.png");
-  const headers = {
-    "Content-Type": "multipart/form-data",
-    token: token,
-  };
+  let stage = "HTTP request";
   try {
-    const res = await axios.post("https://server.simpletex.cn/api/latex_ocr", formData, { headers });
-    // console.log(res);
-    const data = res.data;
+    const token = getPreferenceValues<{ token: string }>().token.trim();
+    if (!token || /[\r\n]/.test(token)) {
+      await showHUD("❌ Invalid SimpleTex API key");
+      return;
+    }
+
+    const response = execFileSync(
+      "/usr/bin/curl",
+      [
+        "--silent",
+        "--show-error",
+        "--max-time",
+        "15",
+        "--header",
+        "@-",
+        "--form",
+        `file=@${savePath}`,
+        "--write-out",
+        "\n%{http_code}",
+        "https://server.simpletex.cn/api/latex_ocr",
+      ],
+      { input: `token: ${token}\n`, encoding: "utf8" },
+    );
+    const statusOffset = response.lastIndexOf("\n");
+    const status = Number(response.slice(statusOffset + 1));
+    if (status < 200 || status >= 300) {
+      await showHUD(`❌ SimpleTex HTTP ${status}`);
+      return;
+    }
+
+    stage = "API response validation";
+    const data = JSON.parse(response.slice(0, statusOffset));
     if (!data.status) {
       throw new Error("API Response Error");
     }
-    const fomart = (await LocalStorage.getItem<string>("format")) ?? "raw";
-    switch (fomart) {
+    stage = "Reading output format";
+    const format = (await LocalStorage.getItem<string>("format")) ?? "raw";
+    stage = "Writing to clipboard";
+    switch (format) {
       case "raw":
         await Clipboard.copy(data.res.latex);
         break;
@@ -46,28 +66,11 @@ export default async () => {
         await Clipboard.copy(data.res.latex);
         break;
     }
-
-    await showHUD("✅ OCR Success");
-    fs.unlinkSync(savePath);
-  } catch (err) {
-    if (axios.isAxiosError(err) && err.response) {
-      const err_dict: { [key: number]: string } = {
-        401: "Failed to authenticate",
-        402: "No resources available to call the interface, such… resource package or insufficient account balance",
-        404: "couldn't find the corresponding API or corresponding version",
-        405: "Error request method",
-        413: "The image file is too large",
-        429: "The maximum number of concurrent requests exceeded, please try again later",
-        500: "Server error due to no file",
-        503: "Server not started/under maintenance",
-      };
-      const status_code: number = err.response.status;
-      const err_msg = err_dict[status_code] || "Unknown error";
-      await showHUD("❌ Request API Failed: " + err_msg);
-    } else {
-      await showHUD("❌ Request API Failed");
-    }
-    fs.unlinkSync(savePath);
+  } catch {
+    await showHUD(`❌ OCR failed: ${stage}`);
     return;
+  } finally {
+    fs.unlinkSync(savePath);
   }
+  await showHUD("✅ OCR Success");
 };
